@@ -382,5 +382,17 @@
         }
     },
     "prefer-stable": true,
-    "minimum-stability": "dev"
+    "minimum-stability": "dev",
+    "extra": {
+        "bougie": {
+            "php": {
+                "version": "8.4"
+            },
+            "services": {
+                "mariadb": "*",
+                "opensearch": "*",
+                "rabbitmq": "*"
+            }
+        }
+    }
 }
