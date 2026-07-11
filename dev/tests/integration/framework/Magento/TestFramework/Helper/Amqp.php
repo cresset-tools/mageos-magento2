@@ -63,7 +63,12 @@ class Amqp
             $this->deploymentConfig->get(self::CONFIG_PATH_HOST),
             defined('RABBITMQ_MANAGEMENT_PORT') ? RABBITMQ_MANAGEMENT_PORT : self::DEFAULT_MANAGEMENT_PORT
         );
-        $this->virtualHost = defined('RABBITMQ_VIRTUALHOST') ? RABBITMQ_VIRTUALHOST : self::DEFAULT_VIRTUALHOST;
+        // Prefer the application's own vhost: management-API assertions must
+        // inspect the vhost the app actually publishes to, which on
+        // multi-tenant/parallel setups is never the '/' default.
+        $this->virtualHost = defined('RABBITMQ_VIRTUALHOST')
+            ? RABBITMQ_VIRTUALHOST
+            : ($this->deploymentConfig->get('queue/amqp/virtualhost') ?? self::DEFAULT_VIRTUALHOST);
     }
 
     /**
