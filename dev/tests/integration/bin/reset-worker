@@ -1,0 +1,159 @@
+#!/usr/bin/env php
+<?php
+/**
+ * Reset a worker slot's database and sandbox var/ to template state.
+ *
+ * Called by bin/parallel-modules between modules on a slot. Three steps,
+ * ~0.5s total where a dump reload costs ~15s (426 CREATE TABLEs are
+ * DDL-bound and don't parallelize):
+ *
+ *   1. Data-only SQL reset: DELETE every table + replay the template
+ *      dump's INSERTs + this worker's search-prefix rows, one
+ *      FK-checks-off transaction (.reset-t<slot>.sql, written by
+ *      parallel-modules).
+ *   2. Restore drifted AUTO_INCREMENT counters. Magento fixtures assume
+ *      install-fresh counters (hardcoded entity ids); a dump-diff shows
+ *      counter drift is the ONLY difference a data reset leaves behind,
+ *      and it alone breaks later modules. Only drifted tables get an
+ *      ALTER, so the DDL cost stays proportional to what the previous
+ *      module touched.
+ *   3. Wipe sandbox var/* — sessions/caches/preprocessed views built
+ *      against the previous module's state.
+ */
+
+$slot = (int) ($argv[1] ?? 0);
+$base   = getenv('BOUGIE_SERVICE_MARIADB_DATABASE');
+$socket = getenv('BOUGIE_SERVICE_MARIADB_SOCKET');
+if ($slot < 1 || !$base || !$socket) {
+    fwrite(STDERR, "usage: reset-worker <slot>, under `bougie run`\n");
+    exit(2);
+}
+
+$root    = dirname(__DIR__);
+$hash    = hash('sha256', sha1_file($root . '/etc/install-config-mysql.php'));
+$db      = "{$base}_t{$slot}";
+$logDir  = "$root/tmp/parallel-logs";
+$clients = glob(getenv('HOME') . '/.local/share/bougie/store/mariadb-*/bin/mariadb') ?: ['mariadb'];
+$client  = end($clients);
+
+$run = static function (string $args, ?string $stdinFile = null) use ($client, $socket): string {
+    $cmd = escapeshellarg($client) . ' --socket=' . escapeshellarg($socket) . ' ' . $args
+        . ($stdinFile !== null ? ' < ' . escapeshellarg($stdinFile) : '');
+    exec($cmd, $out, $rc);
+    if ($rc !== 0) {
+        fwrite(STDERR, "reset-worker: mariadb failed (rc=$rc): $args\n");
+        exit(1);
+    }
+    return implode("\n", $out);
+};
+
+// Reconcile schema against the template before the replay: DELETE data
+// from template tables, DROP tables tests created (per-store index
+// tables and the like) — both derived from THIS worker's live schema,
+// since a static list goes stale in both directions.
+$templateTables = array_flip(
+    json_decode((string) file_get_contents("$logDir/.template-tables.json"), true) ?: []
+);
+$live = $run('-N ' . escapeshellarg($db) . ' -e ' . escapeshellarg(
+    "SELECT table_name FROM information_schema.tables" .
+    " WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE'"
+));
+$pre = "SET FOREIGN_KEY_CHECKS=0;\n";
+// Triggers first: tests that put mview in schedule mode leave changelog
+// triggers behind; the template has none, and a leftover trigger firing
+// into a dropped _cl table fails the DELETEs below.
+$triggers = $run('-N ' . escapeshellarg($db) . ' -e ' . escapeshellarg(
+    "SELECT trigger_name FROM information_schema.triggers WHERE trigger_schema = DATABASE()"
+));
+foreach (array_filter(array_map('trim', explode("\n", $triggers))) as $trigger) {
+    $pre .= "DROP TRIGGER IF EXISTS `$trigger`;\n";
+}
+$liveTables = array_filter(array_map('trim', explode("\n", $live)));
+$missing = array_diff(array_keys($templateTables), $liveTables);
+$preFile = "$logDir/.reconcile-t$slot.sql";
+if ($missing) {
+    // Template tables have vanished (e.g. the server was killed mid-DDL,
+    // which loses the table a TRUNCATE was rebuilding): the incremental
+    // reset can't recover schema, so drop everything and reload the
+    // template dump — the slow path, but self-healing.
+    fwrite(STDERR, 'reset-worker: slot ' . $slot . ': ' . count($missing)
+        . " template table(s) missing, reloading dump\n");
+    foreach ($liveTables as $liveTable) {
+        $pre .= "DROP TABLE `$liveTable`;\n";
+    }
+    file_put_contents($preFile, $pre);
+    $run(escapeshellarg($db), $preFile);
+    $run(escapeshellarg($db), "$root/tmp/sandbox-0-$hash/setup_dump_$base.sql");
+} else {
+    foreach ($liveTables as $liveTable) {
+        $pre .= isset($templateTables[$liveTable])
+            ? "DELETE FROM `$liveTable`;\n"
+            : "DROP TABLE `$liveTable`;\n";
+    }
+    file_put_contents($preFile, $pre);
+    $run(escapeshellarg($db), $preFile);
+}
+
+$run(escapeshellarg($db), "$logDir/.reset-t$slot.sql");
+
+$template = json_decode((string) file_get_contents("$logDir/.autoinc.json"), true) ?: [];
+$current  = $run('-N ' . escapeshellarg($db) . ' -e ' . escapeshellarg(
+    'SELECT table_name, auto_increment FROM information_schema.tables' .
+    " WHERE table_schema = DATABASE() AND auto_increment IS NOT NULL"
+));
+$alters = '';
+foreach (array_filter(explode("\n", $current)) as $line) {
+    [$table, $counter] = explode("\t", $line);
+    $want = $template[$table] ?? 1;
+    if ((int) $counter !== (int) $want) {
+        $alters .= "ALTER TABLE `$table` AUTO_INCREMENT=$want; ";
+    }
+}
+if ($alters !== '') {
+    $run(escapeshellarg($db) . ' -e ' . escapeshellarg($alters));
+}
+
+// AMQP hygiene, all scoped to this worker. Leaked queue:consumers:start
+// processes from a killed run keep consuming — they eat later runs' RPC
+// replies and MessageQueue tests hang forever waiting. Identify this
+// worker's consumers by TEST_TOKEN in their environment, then recreate
+// the worker's own vhost so stale messages and drifted topology go too.
+$amqpVhost = getenv('BOUGIE_SERVICE_RABBITMQ_VHOST');
+$amqpUser  = getenv('BOUGIE_SERVICE_RABBITMQ_USER');
+if ($amqpVhost && $amqpUser) {
+    exec("pgrep -f 'queue:consumers:start'", $consumerPids);
+    foreach ($consumerPids as $pid) {
+        $environ = @file_get_contents("/proc/$pid/environ");
+        if ($environ !== false && str_contains($environ, "TEST_TOKEN=$slot\0")) {
+            exec('kill -9 ' . (int) $pid);
+        }
+    }
+    $workerVhost = escapeshellarg("{$amqpVhost}_t{$slot}");
+    exec("rabbitmqctl -q delete_vhost $workerVhost 2>/dev/null");
+    exec("rabbitmqctl -q add_vhost $workerVhost");
+    exec("rabbitmqctl -q set_permissions -p $workerVhost " . escapeshellarg($amqpUser) . " '.*' '.*' '.*'");
+}
+
+// env.php is worker state Magento itself rewrites during tests; a killed
+// process can leave it corrupt (observed: `<?php return null;`).
+// Regenerate it from the template install every reset.
+$env = include "$root/tmp/sandbox-0-$hash/etc/env.php";
+$env['db']['connection']['default']['dbname'] = $db;
+if ($amqpVhost && isset($env['queue']['amqp'])) {
+    $env['queue']['amqp']['virtualhost'] = "{$amqpVhost}_t{$slot}";
+}
+file_put_contents(
+    "$root/tmp/sandbox-{$slot}-{$hash}/etc/env.php",
+    "<?php\nreturn " . var_export($env, true) . ";\n"
+);
+
+exec('rm -rf ' . escapeshellarg("$root/tmp/sandbox-{$slot}-{$hash}/var") . '/*');
+
+// Drop this worker's OpenSearch indices: the DB reset restores template
+// indexer state, and a stale same-name index from the previous module
+// makes the next reindex fail with resource_already_exists.
+$osHost = getenv('BOUGIE_SERVICE_OPENSEARCH_HOST');
+$osPort = getenv('BOUGIE_SERVICE_OPENSEARCH_PORT');
+if ($osHost && $osPort) {
+    exec('curl -s -o /dev/null -X DELETE ' . escapeshellarg("http://$osHost:$osPort/it_t{$slot}_*"));
+}
