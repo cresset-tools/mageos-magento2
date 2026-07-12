@@ -25,6 +25,7 @@
         "ext-gd": "*",
         "ext-hash": "*",
         "ext-iconv": "*",
+        "ext-imagick": "*",
         "ext-intl": "*",
         "ext-mbstring": "*",
         "ext-openssl": "*",
