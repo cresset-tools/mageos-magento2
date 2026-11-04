@@ -569,9 +569,26 @@ file_put_contents("$out/$sha/index.html", $p);
 // code changed), flaky = flips vs the previous run of the *same* commit.
 // Memory-safe: only the current, immediately-prior, and previous-distinct-
 // commit baselines are held at once.
+//
+// Baselines are pruned to the newest 60 (above), so rows for older runs are
+// carried over from the previous runs.json instead — that is what lets the
+// paged index reach further back than the baselines on disk. Rows are keyed
+// by run id (baseline file name); legacy rows without one are recomputed.
 $runsFile  = "$out/runs.json";
 $histFiles = glob("$baseDir/baselines/*.json");
 usort($histFiles, fn ($a, $b) => strcmp($runTime($a), $runTime($b)));
+$onDisk  = array_flip(array_map(fn ($f) => basename($f, '.json'), $histFiles));
+$oldRows = [];       // id => row, from the previous runs.json
+$keptRows = [];      // rows whose baseline has been pruned (always the oldest)
+foreach (json_decode((string) @file_get_contents($runsFile), true) ?: [] as $r) {
+    if (!isset($r['id'])) {
+        continue;
+    }
+    $oldRows[$r['id']] = $r;
+    if (!isset($onDisk[$r['id']])) {
+        $keptRows[] = $r;
+    }
+}
 $runRows  = [];
 $lastRun  = null;   // immediately previous run
 $prevDiff = null;   // last run of the previous distinct commit
@@ -605,7 +622,11 @@ foreach ($histFiles as $f) {
             }
         }
     }
-    $runRows[] = [
+    $rid = basename($f, '.json');
+    // The oldest surviving baseline has nothing to diff against once its
+    // predecessor is pruned; keep the stats computed while it still had one.
+    $runRows[] = (!$lastRun && $keptRows && isset($oldRows[$rid])) ? $oldRows[$rid] : [
+        'id' => $rid,
         'sha' => $run['sha'] ?? '', 'date' => $run['date'] ?? '',
         'tests' => count($run['tests']), 'failing' => $failing,
         'new' => $newF, 'fixed' => $fixedF, 'flaky' => $flakyF,
@@ -613,42 +634,87 @@ foreach ($histFiles as $f) {
     $lastRun = ['sha' => $run['sha'] ?? '', 'date' => $run['date'] ?? '', 'tests' => $run['tests']];
     unset($run);
 }
+$runRows = array_merge($keptRows, $runRows);
 file_put_contents($runsFile, json_encode($runRows, JSON_PRETTY_PRINT) . "\n");
 
-$idx = $pageOpen('mageos-magento2 integration tests', 'mage-os/mageos-magento2 · main');
-$idx .= '<h1>mageos-magento2 · integration test runs</h1>'
-    . '<p class=hint><b>newly failing / passing</b> = what changed vs the previous <em>commit</em> '
-    . '(stable across re-runs). <b>flaky</b> = tests that flipped pass&harr;fail between re-runs of '
-    . 'the <em>same</em> commit &mdash; identical code, so definitive flakes. Re-runs are grouped '
-    . 'under their commit.</p>'
-    . '<div style="overflow-x:auto"><table><tr><th>date</th><th>commit</th><th class=num>tests</th>'
-    . '<th class=num>failing</th><th class=num>newly failing</th><th class=num>newly passing</th>'
-    . '<th class=num>flaky</th></tr>';
-$numCell = fn ($v, string $col) => '<td class=num' . ($v ? " style=\"color:$col;font-weight:600\"" : '')
-    . '>' . ($v ?: '·') . '</td>';
-$prevSha = null;
+// Paged newest-first, 50 commits per page. Paging is by commit, not by row,
+// so a commit's re-runs never get split from it across a page boundary.
+// Page 1 is index.html, page N is page-N.html, all in the same directory so
+// the run links stay relative.
+$perPage = 50;
+$groups  = [];
 foreach (array_reverse($runRows) as $r) {
-    $isRerun = ($r['sha'] === $prevSha);
-    $prevSha = $r['sha'];
-    $color   = $r['failing'] ? '#c62828' : '#2e7d32';
-    $flCell  = $numCell((int) ($r['flaky'] ?? 0), '#ef6c00');
-    if ($isRerun) {
-        $idx .= '<tr class=sub><td>&#8627; <a href="' . h($r['sha']) . '/index.html" class=rerun>'
-            . h(substr($r['date'], 0, 16)) . '</a></td>'
-            . '<td class=dim><a href="' . h($r['sha']) . '/index.html"><code>' . h(substr($r['sha'], 0, 12)) . '</code></a></td>'
-            . '<td class=num>' . number_format($r['tests']) . '</td>'
-            . '<td class=num style="color:' . $color . '">' . $r['failing'] . '</td>'
-            . '<td class=num>·</td><td class=num>·</td>' . $flCell . '</tr>';
+    if ($groups && $groups[count($groups) - 1][0]['sha'] === $r['sha']) {
+        $groups[count($groups) - 1][] = $r;
     } else {
-        $idx .= '<tr><td>' . h(substr($r['date'], 0, 16)) . '</td>'
-            . '<td><a href="' . h($r['sha']) . '/index.html"><code>' . h(substr($r['sha'], 0, 12)) . '</code></a></td>'
-            . '<td class=num>' . number_format($r['tests']) . '</td>'
-            . '<td class=num style="color:' . $color . ';font-weight:600">' . $r['failing'] . '</td>'
-            . $numCell((int) ($r['new'] ?? 0), '#c62828') . $numCell((int) ($r['fixed'] ?? 0), '#2e7d32') . $flCell . '</tr>';
+        $groups[] = [$r];
     }
 }
-$idx .= '</table></div></main>';
-file_put_contents("$out/index.html", $idx);
+$pages    = array_chunk($groups, $perPage) ?: [[]];
+$nPages   = count($pages);
+$pageFile = fn (int $n): string => $n === 1 ? 'index.html' : "page-$n.html";
+foreach (glob("$out/page-*.html") as $stale) {
+    if (preg_match('/page-(\d+)\.html$/', $stale, $m) && (int) $m[1] > $nPages) {
+        @unlink($stale);
+    }
+}
+$pager = function (int $n) use ($nPages, $pageFile): string {
+    if ($nPages < 2) {
+        return '';
+    }
+    $nav = '<nav class=pager>'
+        . ($n > 1 ? '<a href="' . $pageFile($n - 1) . '">&larr; newer</a>' : '<span>&larr; newer</span>');
+    for ($i = 1; $i <= $nPages; $i++) {
+        $nav .= $i === $n ? "<b>$i</b>" : '<a href="' . $pageFile($i) . "\">$i</a>";
+    }
+    return $nav . ($n < $nPages ? '<a href="' . $pageFile($n + 1) . '">older &rarr;</a>' : '<span>older &rarr;</span>')
+        . '</nav>';
+};
+$numCell = fn ($v, string $col) => '<td class=num' . ($v ? " style=\"color:$col;font-weight:600\"" : '')
+    . '>' . ($v ?: '·') . '</td>';
+
+foreach ($pages as $pi => $pageGroups) {
+    $pn  = $pi + 1;
+    $idx = $pageOpen(
+        'mageos-magento2 integration tests' . ($pn > 1 ? " · page $pn" : ''),
+        'mage-os/mageos-magento2 · main'
+    );
+    $idx .= '<style>.pager{display:flex;gap:4px;flex-wrap:wrap;align-items:center;margin:12px 0;font-size:13px}'
+        . '.pager a,.pager b,.pager span{padding:3px 9px;border-radius:6px;border:1px solid #e2e5ea;background:#fff;text-decoration:none}'
+        . '.pager b{background:#25508f;color:#fff;border-color:#25508f}.pager span{color:#b0b7c3}</style>';
+    $idx .= '<h1>mageos-magento2 · integration test runs' . ($pn > 1 ? " <small>page $pn of $nPages</small>" : '') . '</h1>'
+        . '<p class=hint><b>newly failing / passing</b> = what changed vs the previous <em>commit</em> '
+        . '(stable across re-runs). <b>flaky</b> = tests that flipped pass&harr;fail between re-runs of '
+        . 'the <em>same</em> commit &mdash; identical code, so definitive flakes. Re-runs are grouped '
+        . 'under their commit.</p>'
+        . $pager($pn)
+        . '<div style="overflow-x:auto"><table><tr><th>date</th><th>commit</th><th class=num>tests</th>'
+        . '<th class=num>failing</th><th class=num>newly failing</th><th class=num>newly passing</th>'
+        . '<th class=num>flaky</th></tr>';
+    $prevSha = null;
+    foreach (array_merge(...$pageGroups ?: [[]]) as $r) {
+        $isRerun = ($r['sha'] === $prevSha);
+        $prevSha = $r['sha'];
+        $color   = $r['failing'] ? '#c62828' : '#2e7d32';
+        $flCell  = $numCell((int) ($r['flaky'] ?? 0), '#ef6c00');
+        if ($isRerun) {
+            $idx .= '<tr class=sub><td>&#8627; <a href="' . h($r['sha']) . '/index.html" class=rerun>'
+                . h(substr($r['date'], 0, 16)) . '</a></td>'
+                . '<td class=dim><a href="' . h($r['sha']) . '/index.html"><code>' . h(substr($r['sha'], 0, 12)) . '</code></a></td>'
+                . '<td class=num>' . number_format($r['tests']) . '</td>'
+                . '<td class=num style="color:' . $color . '">' . $r['failing'] . '</td>'
+                . '<td class=num>·</td><td class=num>·</td>' . $flCell . '</tr>';
+        } else {
+            $idx .= '<tr><td>' . h(substr($r['date'], 0, 16)) . '</td>'
+                . '<td><a href="' . h($r['sha']) . '/index.html"><code>' . h(substr($r['sha'], 0, 12)) . '</code></a></td>'
+                . '<td class=num>' . number_format($r['tests']) . '</td>'
+                . '<td class=num style="color:' . $color . ';font-weight:600">' . $r['failing'] . '</td>'
+                . $numCell((int) ($r['new'] ?? 0), '#c62828') . $numCell((int) ($r['fixed'] ?? 0), '#2e7d32') . $flCell . '</tr>';
+        }
+    }
+    $idx .= '</table></div>' . $pager($pn) . '</main>';
+    file_put_contents("$out/" . $pageFile($pn), $idx);
+}
 
 printf(
     "report: %s/%s/index.html  (%d tests, %d failing, %d new, %d fixed, %d flaky, %d runs listed, %d job pages)\n",
