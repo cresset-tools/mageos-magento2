@@ -1,0 +1,17 @@
+# Test-harness environment for bougie. This lives here rather than in
+# composer.json's extra.bougie so the harness branch never edits
+# composer.json/composer.lock: upstream changes those, and every edit of
+# ours became a rebase conflict on composer.lock's content-hash line.
+#
+# imagick (needed by the image tests) can't be enabled from here — bougie
+# only installs extensions that composer.json requires — so the nightly
+# runner adds it after the rebase with `bougie ext add imagick`, leaving
+# the change uncommitted.
+
+[php]
+version = "8.4"
+
+[services]
+mariadb = "*"
+opensearch = "*"
+rabbitmq = "*"
