@@ -88,6 +88,24 @@ if ($amqpVhostBase && $amqpUserBase) {
             fn ($e) => ($e['vhost'] ?? null) === $amqpVhostBase
         ));
     }
+    // export_definitions leaves out auto-delete exchanges, but setup declares
+    // some (TopologyTest checks magento-topic-based-exchange3), so add them.
+    exec('rabbitmqctl -q list_exchanges -p ' . escapeshellarg($amqpVhostBase)
+        . ' name type durable auto_delete internal arguments --formatter json 2>/dev/null', $out);
+    foreach (json_decode(implode("\n", $out), true) ?: [] as $e) {
+        if (!$e['auto_delete']) {
+            continue;
+        }
+        // arguments come back as a list of [key, value] pairs
+        $args = array_is_list($e['arguments'])
+            ? array_column($e['arguments'], 1, 0)
+            : $e['arguments'];
+        $topology['exchanges'][] = [
+            'name' => $e['name'], 'vhost' => $amqpVhostBase, 'type' => $e['type'],
+            'durable' => $e['durable'], 'auto_delete' => true, 'internal' => $e['internal'],
+            'arguments' => (object) $args,
+        ];
+    }
     file_put_contents("$root/tmp/parallel-logs/.amqp-topology.json", json_encode($topology) . "\n");
     @unlink($defsFile);
     printf(
