@@ -19,6 +19,13 @@ define('TESTS_PARALLEL_RUN', 1);
 if ($token > 0) {
     putenv('BOUGIE_SERVICE_MARIADB_DATABASE=' . getenv('BOUGIE_SERVICE_MARIADB_DATABASE') . '_t' . $token);
 }
+// Each worker also has its own RabbitMQ vhost (see bin/parallel-prime).
+// Tests read it from this constant (TopologyTest builds its expected
+// configuration from it), so it must match the vhost the app uses.
+$amqpVhost = getenv('BOUGIE_SERVICE_RABBITMQ_VHOST');
+if ($amqpVhost && !defined('RABBITMQ_VIRTUALHOST')) {
+    define('RABBITMQ_VIRTUALHOST', $token > 0 ? "{$amqpVhost}_t{$token}" : $amqpVhost);
+}
 
 // The lock only guards the first-ever test-module deploy (the framework
 // copies them into the shared app/code/Magento once; see the
