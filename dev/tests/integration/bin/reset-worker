@@ -23,8 +23,7 @@
 
 $slot = (int) ($argv[1] ?? 0);
 $base   = getenv('BOUGIE_SERVICE_MARIADB_DATABASE');
-$socket = getenv('BOUGIE_SERVICE_MARIADB_SOCKET');
-if ($slot < 1 || !$base || !$socket) {
+if ($slot < 1 || !$base) {
     fwrite(STDERR, "usage: reset-worker <slot>, under `bougie run`\n");
     exit(2);
 }
@@ -33,11 +32,11 @@ $root    = dirname(__DIR__);
 $hash    = hash('sha256', sha1_file($root . '/etc/install-config-mysql.php'));
 $db      = "{$base}_t{$slot}";
 $logDir  = "$root/tmp/parallel-logs";
-$clients = glob(getenv('HOME') . '/.local/share/bougie/store/mariadb-*/bin/mariadb') ?: ['mariadb'];
-$client  = end($clients);
+// As the OS user (unix_socket auth), like parallel-prime.
+$client  = 'bougie service exec mariadb -- --user=' . escapeshellarg(trim((string) shell_exec('id -un')));
 
-$run = static function (string $args, ?string $stdinFile = null) use ($client, $socket): string {
-    $cmd = escapeshellarg($client) . ' --socket=' . escapeshellarg($socket) . ' ' . $args
+$run = static function (string $args, ?string $stdinFile = null) use ($client): string {
+    $cmd = $client . ' ' . $args
         . ($stdinFile !== null ? ' < ' . escapeshellarg($stdinFile) : '');
     exec($cmd, $out, $rc);
     if ($rc !== 0) {
