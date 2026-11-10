@@ -125,9 +125,6 @@ printf("%d jobs, %d workers, timeout %ds default\n", count($queue), $workers, $t
 // drop the schema. Without this, a module that crashes mid-fixture
 // poisons every later module on its slot.
 $base   = getenv('BOUGIE_SERVICE_MARIADB_DATABASE');
-$socket = getenv('BOUGIE_SERVICE_MARIADB_SOCKET');
-$clients = glob(getenv('HOME') . '/.local/share/bougie/store/mariadb-*/bin/mariadb') ?: ['mariadb'];
-$client  = end($clients);
 $hash   = hash('sha256', sha1_file("$root/etc/install-config-mysql.php"));
 $dump   = "$root/tmp/sandbox-0-$hash/setup_dump_$base.sql";
 $inserts = [];

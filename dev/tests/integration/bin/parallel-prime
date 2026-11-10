@@ -28,9 +28,8 @@ if ($workers < 1 || $workers > 64) {
 }
 
 $base   = getenv('BOUGIE_SERVICE_MARIADB_DATABASE');
-$socket = getenv('BOUGIE_SERVICE_MARIADB_SOCKET');
 $tenant = getenv('BOUGIE_SERVICE_MARIADB_USER');
-if (!$base || !$socket || !$tenant) {
+if (!$base || !$tenant) {
     fwrite(STDERR, "BOUGIE_SERVICE_MARIADB_* not set — run me under `bougie run`.\n");
     exit(2);
 }
@@ -45,19 +44,14 @@ if (!is_file("$template/etc/env.php") || !is_file($dump)) {
     exit(1);
 }
 
-// Raw client, no tenant shim: connecting over the socket as the OS user
-// authenticates via unix_socket with admin rights (needed for CREATE
-// DATABASE + GRANT; the tenant grant covers only its own database).
-$clients = glob(getenv('HOME') . '/.local/share/bougie/store/mariadb-*/bin/mariadb');
-if (!$clients) {
-    fwrite(STDERR, "no mariadb client under ~/.local/share/bougie/store\n");
-    exit(1);
-}
-$client = end($clients);
+// bougie picks the client and socket; connecting as the OS user instead of
+// the tenant authenticates via unix_socket with admin rights (needed for
+// CREATE DATABASE + GRANT; the tenant grant covers only its own database).
+$client = 'bougie service exec mariadb -- --user=' . escapeshellarg(trim((string) shell_exec('id -un')));
 
-function sql(string $client, string $socket, string $sql, ?string $db = null): void
+function sql(string $client, string $sql, ?string $db = null): void
 {
-    $cmd = escapeshellarg($client) . ' --socket=' . escapeshellarg($socket)
+    $cmd = $client
         . ($db !== null ? ' ' . escapeshellarg($db) : '')
         . ' -e ' . escapeshellarg($sql);
     passthru($cmd, $rc);
@@ -129,12 +123,11 @@ for ($t = 1; $t <= $workers; $t++) {
     $db   = "{$base}_t{$t}";
     $dest = "$root/tmp/sandbox-{$t}-{$hash}";
 
-    sql($client, $socket,
+    sql($client,
         "CREATE DATABASE IF NOT EXISTS `$db` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; " .
         "GRANT ALL PRIVILEGES ON `$db`.* TO '$tenant'@'localhost';");
 
-    $load = escapeshellarg($client) . ' --socket=' . escapeshellarg($socket)
-        . ' ' . escapeshellarg($db) . ' < ' . escapeshellarg($dump);
+    $load = $client . ' ' . escapeshellarg($db) . ' < ' . escapeshellarg($dump);
     passthru($load, $rc);
     if ($rc !== 0) {
         fwrite(STDERR, "loading dump into $db failed (rc=$rc)\n");
@@ -153,7 +146,7 @@ for ($t = 1; $t <= $workers; $t++) {
         $prefixSql .= " INSERT INTO core_config_data (scope, scope_id, path, value)" .
             " VALUES ('default', 0, 'catalog/search/{$engine}_index_prefix', 'it_t{$t}');";
     }
-    sql($client, $socket, $prefixSql, $db);
+    sql($client, $prefixSql, $db);
 
     passthru('rm -rf ' . escapeshellarg($dest));
     passthru('cp -a ' . escapeshellarg($template) . ' ' . escapeshellarg($dest), $rc);
